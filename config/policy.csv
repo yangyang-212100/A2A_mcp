@@ -1,0 +1,6 @@
+p, did:agent:fin_analyst, urn:mcp:audit, read, allow
+p, did:agent:fin_analyst, urn:mcp:report, read, allow
+p, did:agent:fin_analyst, urn:mcp:delete_db, deny
+p, did:agent:hr_agent, urn:mcp:employee_data, read, allow
+p, did:agent:hr_agent, urn:mcp:delete_db, deny
+
