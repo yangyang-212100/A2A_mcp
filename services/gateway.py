@@ -598,6 +598,166 @@ async def list_registered_agents():
     }
 
 
+@app.get("/gateway/query-agent")
+async def query_agent_endpoint(
+    agent_type: Optional[str] = None,
+    task_type: Optional[str] = None
+):
+    """
+    查询 Agent 端点。
+    
+    MainAgent 通过此端点查询合适的 Task Agent。
+    
+    Query Parameters:
+        agent_type: Agent 类型 (如 "finance", "hr")
+        task_type: 任务类型 (如 "audit", "report")
+    """
+    if task_type:
+        # 根据任务类型查找 Agent
+        agent_did = registry.find_agent_for_task(task_type)
+        if agent_did:
+            metadata = registry.get_agent_metadata(agent_did)
+            return {
+                "status": "found",
+                "agent_did": agent_did,
+                "metadata": metadata
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": f"No agent found for task type: {task_type}"
+            }
+    
+    if agent_type:
+        # 根据 Agent 类型查找
+        agents = registry.get_agents_by_type(agent_type)
+        if agents:
+            return {
+                "status": "found",
+                "agents": [
+                    {"agent_did": did, "metadata": registry.get_agent_metadata(did)}
+                    for did in agents
+                ]
+            }
+        else:
+            return {
+                "status": "not_found",
+                "message": f"No agents found for type: {agent_type}"
+            }
+    
+    # 返回所有 Agent
+    return {
+        "status": "success",
+        "agents": registry.get_all_agent_info()
+    }
+
+
+@app.post("/gateway/collaboration/add-agent")
+async def add_agent_to_collaboration(
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-Id")
+):
+    """
+    将 Agent 添加到协作组。
+    
+    在授权成功后，将 Task Agent 添加到当前会话的协作组中。
+    
+    请求体:
+    {
+        "agent_did": "did:agent:fin_analyst",
+        "authorization_token": "..." (可选，网关颁发的授权凭证)
+    }
+    """
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    if not x_session_id:
+        raise HTTPException(status_code=400, detail="Missing X-Session-Id header")
+    
+    # 验证用户 JWT
+    try:
+        user_info = decode_user_jwt(x_user_token)
+        user_id = user_info.get("uid")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    # 检查会话是否存在
+    if x_session_id not in collaboration_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = collaboration_sessions[x_session_id]
+    
+    # 验证会话所属用户
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+    
+    # 获取请求体
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    
+    agent_did = body.get("agent_did")
+    if not agent_did:
+        raise HTTPException(status_code=400, detail="Missing agent_did")
+    
+    # 检查 Agent 是否已注册
+    if not registry.is_registered(agent_did):
+        raise HTTPException(status_code=404, detail=f"Agent {agent_did} is not registered")
+    
+    # 添加到协作组
+    if agent_did not in session["authorized_agents"]:
+        session["authorized_agents"].append(agent_did)
+        print(f"[Gateway] Agent {agent_did} added to collaboration session {x_session_id}")
+    
+    return {
+        "status": "success",
+        "message": f"Agent {agent_did} added to collaboration",
+        "session_id": x_session_id,
+        "authorized_agents": session["authorized_agents"]
+    }
+
+
+@app.get("/gateway/collaboration/{session_id}/agents")
+async def get_collaboration_agents(
+    session_id: str,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token")
+):
+    """
+    获取协作组中的 Agent 列表。
+    """
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    # 验证用户 JWT
+    try:
+        user_info = decode_user_jwt(x_user_token)
+        user_id = user_info.get("uid")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    if session_id not in collaboration_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = collaboration_sessions[session_id]
+    
+    # 验证会话所属用户
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=403, detail="Session does not belong to this user")
+    
+    return {
+        "session_id": session_id,
+        "user_id": session["user_id"],
+        "authorized_agents": session["authorized_agents"],
+        "created_at": session["created_at"]
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

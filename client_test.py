@@ -10,7 +10,6 @@ import httpx
 
 from agents.main_agent import MainAgent
 from agents.finance_agent import FinanceAgent, HRAgent
-from services.registry import registry
 
 
 GATEWAY_URL = "http://localhost:8000"
@@ -34,8 +33,8 @@ def create_user_jwt(uid: str, role: str, dept: str) -> str:
 
 
 async def register_agents_to_gateway():
-    """将所有 Agent 注册到网关的注册中心和本地注册中心。"""
-    print("\n[Setup] Registering agents to gateway and local registry...")
+    """将所有 Agent 通过 HTTP 注册到网关的注册中心。"""
+    print("\n[Setup] Registering agents to gateway via HTTP...")
     
     # 创建 Agent 实例
     finance_agent = FinanceAgent()
@@ -47,10 +46,7 @@ async def register_agents_to_gateway():
     ]
     
     for agent, metadata in agents:
-        # 注册到本地 registry (供 MainAgent 查找)
-        registry.register_agent(agent.agent_did, agent.public_key, metadata)
-        
-        # 注册到网关的 registry
+        # 通过 HTTP 注册到网关的 registry
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.post(
@@ -62,7 +58,7 @@ async def register_agents_to_gateway():
                     }
                 )
                 if response.status_code == 200:
-                    print(f"[Setup] Registered: {agent.agent_did}")
+                    print(f"[Setup] Registered via HTTP: {agent.agent_did}")
                 else:
                     print(f"[Setup] Failed to register {agent.agent_did}: {response.text}")
         except Exception as e:

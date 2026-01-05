@@ -5,9 +5,12 @@ Main Agent (Orchestrator)
 职责：
 1. 接收网关转发的用户请求
 2. 进行意图识别与任务拆解
-3. 查询 Agent 注册中心获取 Task Agent DID
-4. 向网关申请调用 Task Agent 的授权
-5. 协调 Task Agent 执行任务
+3. 通过 HTTP 向网关查询 Task Agent
+4. 通过 HTTP 向网关申请调用 Task Agent 的授权
+5. 通过 HTTP 将授权的 Agent 添加到协作组
+6. 协调 Task Agent 执行任务
+
+所有与网关/注册中心的交互都通过 HTTP 进行！
 """
 
 import httpx
@@ -15,7 +18,6 @@ from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
 from agents.base_agent import BaseAgent
-from services.registry import registry
 
 
 GATEWAY_URL = "http://localhost:8000"
@@ -35,12 +37,15 @@ class MainAgent(BaseAgent):
     主 Agent (协调者)。
     
     负责接收用户请求，进行意图识别和任务拆解，
-    然后向网关申请调用相应的 Task Agent。
+    然后通过 HTTP 向网关申请调用相应的 Task Agent。
+    
+    所有与注册中心/网关的交互都通过 HTTP API 进行。
     """
     
-    def __init__(self):
+    def __init__(self, gateway_url: str = GATEWAY_URL):
         super().__init__(agent_did="did:agent:main_orchestrator")
-        self._authorized_agents: List[str] = []  # 已授权的 Agent 列表
+        self._gateway_url = gateway_url
+        self._current_session_id: Optional[str] = None
     
     def analyze_intent(self, user_query: str) -> List[TaskDecomposition]:
         """
@@ -92,22 +97,41 @@ class MainAgent(BaseAgent):
         print(f"[MainAgent] Identified {len(tasks)} task(s): {[t.task_type for t in tasks]}")
         return tasks
     
-    def find_agent_for_task(self, task: TaskDecomposition) -> Optional[str]:
+    async def query_agent_from_gateway(self, task_type: str) -> Optional[str]:
         """
-        从注册中心查找合适的 Task Agent。
+        通过 HTTP 向网关查询合适的 Task Agent。
         
         Args:
-            task: 任务拆解结果
+            task_type: 任务类型
             
         Returns:
             Task Agent 的 DID，如果没有找到则返回 None
         """
-        agent_did = registry.find_agent_for_task(task.required_agent_type)
-        if agent_did:
-            print(f"[MainAgent] Found agent for task '{task.task_type}': {agent_did}")
-        else:
-            print(f"[MainAgent] No agent found for task type: {task.required_agent_type}")
-        return agent_did
+        print(f"[MainAgent] Querying gateway for agent (task_type: {task_type})")
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self._gateway_url}/gateway/query-agent",
+                    params={"task_type": task_type},
+                    timeout=10.0
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    if result.get("status") == "found":
+                        agent_did = result.get("agent_did")
+                        print(f"[MainAgent] Found agent via gateway: {agent_did}")
+                        return agent_did
+                    else:
+                        print(f"[MainAgent] No agent found for task type: {task_type}")
+                        return None
+                else:
+                    print(f"[MainAgent] Gateway query failed: {response.status_code}")
+                    return None
+        except httpx.HTTPError as e:
+            print(f"[MainAgent] HTTP error querying gateway: {e}")
+            return None
     
     async def request_agent_authorization(
         self,
@@ -117,7 +141,7 @@ class MainAgent(BaseAgent):
         session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        向网关申请调用 Task Agent 的授权。
+        通过 HTTP 向网关申请调用 Task Agent 的授权。
         
         Args:
             user_jwt: 用户的 JWT Token
@@ -128,9 +152,7 @@ class MainAgent(BaseAgent):
         Returns:
             授权结果
         """
-        print(f"[MainAgent] Requesting authorization to call {target_agent_did}")
-        
-        gateway_url = f"{GATEWAY_URL}/gateway/authorize-agent-call"
+        print(f"[MainAgent] Requesting authorization via HTTP: {target_agent_did}")
         
         headers = {
             "X-User-Token": user_jwt,
@@ -148,7 +170,7 @@ class MainAgent(BaseAgent):
         try:
             async with httpx.AsyncClient() as client:
                 response = await client.post(
-                    gateway_url,
+                    f"{self._gateway_url}/gateway/authorize-agent-call",
                     json=request_body,
                     headers=headers,
                     timeout=30.0
@@ -158,10 +180,10 @@ class MainAgent(BaseAgent):
                 
                 if response.status_code == 200:
                     print(f"[MainAgent] Authorization GRANTED for {target_agent_did}")
-                    self._authorized_agents.append(target_agent_did)
                     return {
                         "status": "authorized",
                         "agent_did": target_agent_did,
+                        "authorization_token": result.get("authorization", {}).get("authorization_token"),
                         "result": result
                     }
                 else:
@@ -181,6 +203,104 @@ class MainAgent(BaseAgent):
                 "error": error_msg
             }
     
+    async def add_agent_to_collaboration(
+        self,
+        user_jwt: str,
+        session_id: str,
+        agent_did: str,
+        authorization_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        通过 HTTP 将授权的 Agent 添加到协作组。
+        
+        Args:
+            user_jwt: 用户的 JWT Token
+            session_id: 协作会话 ID
+            agent_did: 要添加的 Agent DID
+            authorization_token: 授权凭证 (可选)
+            
+        Returns:
+            添加结果
+        """
+        print(f"[MainAgent] Adding agent to collaboration via HTTP: {agent_did}")
+        
+        headers = {
+            "X-User-Token": user_jwt,
+            "X-Session-Id": session_id,
+            "Content-Type": "application/json"
+        }
+        
+        request_body = {
+            "agent_did": agent_did
+        }
+        if authorization_token:
+            request_body["authorization_token"] = authorization_token
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self._gateway_url}/gateway/collaboration/add-agent",
+                    json=request_body,
+                    headers=headers,
+                    timeout=10.0
+                )
+                
+                result = response.json()
+                
+                if response.status_code == 200:
+                    print(f"[MainAgent] Agent {agent_did} added to collaboration")
+                    return {
+                        "status": "success",
+                        "agent_did": agent_did,
+                        "result": result
+                    }
+                else:
+                    print(f"[MainAgent] Failed to add agent to collaboration: {result}")
+                    return {
+                        "status": "error",
+                        "agent_did": agent_did,
+                        "error": result.get("detail", "Unknown error")
+                    }
+        except httpx.HTTPError as e:
+            error_msg = f"HTTP error: {str(e)}"
+            print(f"[MainAgent] {error_msg}")
+            return {
+                "status": "error",
+                "agent_did": agent_did,
+                "error": error_msg
+            }
+    
+    async def get_collaboration_agents(
+        self,
+        user_jwt: str,
+        session_id: str
+    ) -> List[str]:
+        """
+        通过 HTTP 获取协作组中的 Agent 列表。
+        
+        Args:
+            user_jwt: 用户的 JWT Token
+            session_id: 协作会话 ID
+            
+        Returns:
+            协作组中的 Agent DID 列表
+        """
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self._gateway_url}/gateway/collaboration/{session_id}/agents",
+                    headers={"X-User-Token": user_jwt},
+                    timeout=10.0
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("authorized_agents", [])
+                else:
+                    return []
+        except httpx.HTTPError:
+            return []
+    
     async def process_user_request(
         self,
         user_jwt: str,
@@ -188,12 +308,13 @@ class MainAgent(BaseAgent):
         session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        处理用户请求的完整流程。
+        处理用户请求的完整流程（全部通过 HTTP）。
         
         1. 意图识别与任务拆解
-        2. 查找需要的 Task Agent
-        3. 向网关申请授权
-        4. 返回处理结果
+        2. 通过 HTTP 向网关查询需要的 Task Agent
+        3. 通过 HTTP 向网关申请授权
+        4. 通过 HTTP 将授权的 Agent 添加到协作组
+        5. 返回处理结果
         
         Args:
             user_jwt: 用户的 JWT Token
@@ -205,18 +326,21 @@ class MainAgent(BaseAgent):
         """
         print(f"\n[MainAgent] ========== Processing User Request ==========")
         print(f"[MainAgent] Query: {user_query}")
+        print(f"[MainAgent] Session: {session_id}")
+        
+        self._current_session_id = session_id
         
         # Step 1: 意图识别与任务拆解
         tasks = self.analyze_intent(user_query)
         
-        # Step 2 & 3: 查找 Agent 并申请授权
+        # Step 2, 3, 4: 查找 Agent、申请授权、添加到协作组
         authorization_results = []
         authorized_agents = []
         denied_agents = []
         
         for task in tasks:
-            # 查找合适的 Agent
-            agent_did = self.find_agent_for_task(task)
+            # Step 2: 通过 HTTP 向网关查询 Agent
+            agent_did = await self.query_agent_from_gateway(task.required_agent_type)
             
             if not agent_did:
                 authorization_results.append({
@@ -226,7 +350,7 @@ class MainAgent(BaseAgent):
                 })
                 continue
             
-            # 向网关申请授权
+            # Step 3: 通过 HTTP 向网关申请授权
             auth_result = await self.request_agent_authorization(
                 user_jwt=user_jwt,
                 target_agent_did=agent_did,
@@ -239,7 +363,21 @@ class MainAgent(BaseAgent):
             authorization_results.append(auth_result)
             
             if auth_result["status"] == "authorized":
-                authorized_agents.append(agent_did)
+                # Step 4: 通过 HTTP 将 Agent 添加到协作组
+                if session_id:
+                    add_result = await self.add_agent_to_collaboration(
+                        user_jwt=user_jwt,
+                        session_id=session_id,
+                        agent_did=agent_did,
+                        authorization_token=auth_result.get("authorization_token")
+                    )
+                    if add_result["status"] == "success":
+                        authorized_agents.append(agent_did)
+                    else:
+                        # 添加失败也算授权成功，只是没加入协作组
+                        authorized_agents.append(agent_did)
+                else:
+                    authorized_agents.append(agent_did)
             else:
                 denied_agents.append({
                     "agent_did": agent_did,
@@ -252,6 +390,7 @@ class MainAgent(BaseAgent):
         result = {
             "status": "completed" if all_authorized else ("partial" if authorized_agents else "denied"),
             "user_query": user_query,
+            "session_id": session_id,
             "tasks_identified": len(tasks),
             "authorized_agents": authorized_agents,
             "denied_agents": denied_agents,
@@ -259,7 +398,7 @@ class MainAgent(BaseAgent):
         }
         
         if all_authorized:
-            result["message"] = f"All {len(authorized_agents)} agent(s) authorized. Ready to execute tasks."
+            result["message"] = f"All {len(authorized_agents)} agent(s) authorized and added to collaboration."
         elif authorized_agents:
             result["message"] = f"{len(authorized_agents)} agent(s) authorized, {len(denied_agents)} denied."
         else:
@@ -281,12 +420,3 @@ class MainAgent(BaseAgent):
             "message": "MainAgent is an orchestrator and does not execute tasks directly. "
                       "Use process_user_request() instead."
         }
-    
-    def get_authorized_agents(self) -> List[str]:
-        """获取当前已授权的 Agent 列表。"""
-        return self._authorized_agents.copy()
-    
-    def clear_authorized_agents(self):
-        """清空已授权的 Agent 列表（新会话时调用）。"""
-        self._authorized_agents.clear()
-
