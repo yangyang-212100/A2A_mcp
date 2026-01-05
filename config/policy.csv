@@ -1,6 +1,16 @@
+# Agent 调用 MCP Tool 的策略
+# 格式: p, agent_did, tool_urn, action, effect
 p, did:agent:fin_analyst, urn:mcp:audit, read, allow
 p, did:agent:fin_analyst, urn:mcp:report, read, allow
-p, did:agent:fin_analyst, urn:mcp:delete_db, deny
 p, did:agent:hr_agent, urn:mcp:employee_data, read, allow
-p, did:agent:hr_agent, urn:mcp:delete_db, deny
 
+# 用户调用 Agent 的策略 (基于部门)
+# 格式: p, user_dept, agent_did, call, effect
+# Finance 部门可以调用 Finance Agent
+p, Finance, did:agent:fin_analyst, call, allow
+# HR 部门可以调用 HR Agent
+p, HR, did:agent:hr_agent, call, allow
+# IT 部门可以调用所有 Agent (系统管理员)
+p, IT, did:agent:fin_analyst, call, allow
+p, IT, did:agent:hr_agent, call, allow
+# Sales 部门不能调用 Finance Agent (跨部门隔离)

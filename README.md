@@ -64,38 +64,77 @@ project_root/
 
 ## 安装依赖
 
+### 1. 创建虚拟环境（推荐）
+
+**Windows:**
+```bash
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+**Linux/Mac:**
+```bash
+python -m venv venv
+source venv/bin/activate
+```
+
+### 2. 安装依赖包
+
 ```bash
 pip install -r requirements.txt
 ```
 
+**注意**: 项目使用 Python 3.10+，已测试兼容 Python 3.13。
+
 ## 运行系统
 
-### 1. 启动 MCP Tool Server
+**重要**: 运行服务前，必须先激活虚拟环境！
 
-```bash
+**Windows PowerShell:**
+```powershell
+# 激活虚拟环境
+.\venv\Scripts\Activate.ps1
+
+# 终端1: 启动 MCP Tool Server
+python -m services.mcp_tool_server
+# 服务运行在 http://localhost:8001
+
+# 终端2: 启动安全网关
+python -m services.gateway
+# 服务运行在 http://localhost:8000
+```
+
+**Windows CMD:**
+```cmd
+venv\Scripts\activate.bat
 python -m services.mcp_tool_server
 ```
 
-服务运行在 `http://localhost:8001`
+**Linux/Mac:**
+```bash
+source venv/bin/activate
+python -m services.mcp_tool_server
+```
 
-### 2. 启动安全网关
+### 3. 运行真实系统测试
 
+**启动网关服务**（在终端1）：
 ```bash
 python -m services.gateway
 ```
 
-服务运行在 `http://localhost:8000`
-
-### 3. 运行工作流模拟
-
+**运行客户端测试**（在终端2）：
 ```bash
-python workflow_simulation.py
+python client_test.py
 ```
 
-这将模拟：
-- ✅ 合规流程：用户登录 → Agent 生成 Token → 网关验证 → MCP 调用成功
-- 🚨 攻击流程1：Token 篡改攻击（签名验证失败）
-- 🚨 攻击流程2：身份绑定不匹配攻击（User Token.uid != Task Token.sub）
+这将执行真实的系统测试，验证网关的身份鉴别和权限控制功能：
+- ✅ 测试1：合规请求 - 用户正确调用 Agent（应该通过）
+- 🛡️ 测试2：身份绑定不匹配攻击（应该被拦截）
+- 🛡️ 测试3：未授权工具访问（应该被拦截）
+- 🛡️ 测试4：Token 篡改攻击（应该被拦截）
+
+**注意**：`client_test.py` 使用网关的 `/gateway/test/` 端点，只进行验证不转发到 MCP，专门用于测试身份鉴别和权限控制功能。
 
 ## 安全网关工作流程
 

@@ -1,7 +1,7 @@
 """
-Workflow Simulation
-模拟完整的 "用户指令 -> Agent生成Token -> 网关拦截" 流程
-包括合规流程和攻击流程
+Workflow Simulation (Deprecated)
+此文件已被 client_test.py 替代
+请使用 client_test.py 进行真实的系统测试
 """
 
 import asyncio

@@ -1,9 +1,9 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-pycasbin==1.16.6
-httpx==0.25.2
-cryptography==41.0.7
-pyjwt==2.8.0
-pydantic==2.5.0
-python-jose[cryptography]==3.3.0
+fastapi>=0.104.1
+uvicorn>=0.24.0
+pycasbin>=2.6.1
+httpx>=0.25.2
+cryptography>=41.0.7
+pyjwt>=2.8.0
+pydantic>=2.8.0
+python-jose[cryptography]>=3.3.0
 

@@ -1,15 +1,24 @@
 """
 Security Gateway (PEP - Policy Enforcement Point)
-核心安全网关：实现 Task-MCP Token 验证和 ABAC 策略执行
+核心安全网关：实现用户身份验证、Agent 调用授权、Task-MCP Token 验证和 ABAC 策略执行
+
+授权流程：
+1. 用户请求 -> 网关验证 JWT -> 转发给 Main Agent
+2. Main Agent 意图识别 -> 申请调用 Task Agent -> 网关 ABAC 鉴权
+3. 授权成功 -> Task Agent 加入协作组
+4. 授权失败 -> 网关直接拒绝用户
 """
 
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Optional, Dict, Any
 import httpx
 import jwt
 import casbin
 import os
+import time
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
 
 from services.registry import registry
 from core.token_manager import decode_task_token_payload, verify_task_token
@@ -26,20 +35,245 @@ enforcer = casbin.Enforcer(casbin_model_path, casbin_policy_path)
 # MCP Tool Server 地址
 MCP_TOOL_SERVER_URL = "http://localhost:8001"
 
+# Main Agent 地址 (用于内部通信)
+MAIN_AGENT_URL = "http://localhost:8002"
+
+# JWT 密钥 (生产环境应该使用安全的密钥管理)
+JWT_SECRET = "dummy_secret"
+
+# 协作组：存储当前会话中授权的 Agent
+# 结构: {session_id: {user_id, user_jwt, authorized_agents: [agent_did]}}
+collaboration_sessions: Dict[str, Dict[str, Any]] = {}
+
 
 def decode_user_jwt(token: str) -> dict:
     """
-    解码 User Identity Token (JWT)。
-    注意：这里简化处理，实际生产环境需要验证 JWT 签名。
+    解码并验证 User Identity Token (JWT)。
     """
     try:
-        # 实际环境中应该验证 JWT 签名和有效期
-        # 这里为了演示，直接解码（不验证签名）
-        decoded = jwt.decode(token, options={"verify_signature": False})
+        # 验证 JWT 签名和有效期
+        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return decoded
-    except Exception as e:
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="User token has expired")
+    except jwt.InvalidTokenError as e:
         raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
 
+
+def create_session_id(user_id: str) -> str:
+    """生成会话 ID。"""
+    return f"session_{user_id}_{int(time.time())}"
+
+
+# ==================== 新增端点：用户请求入口 ====================
+
+@app.post("/gateway/user-request")
+async def user_request_endpoint(
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token")
+):
+    """
+    用户请求入口端点。
+    
+    流程：
+    1. 验证用户 JWT
+    2. 创建协作会话
+    3. 转发请求给 Main Agent
+    """
+    # ========== Step 1: 验证用户 JWT ==========
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    print(f"\n[Gateway] ========== User Request Received ==========")
+    print(f"[Gateway] Validating user JWT...")
+    
+    try:
+        user_info = decode_user_jwt(x_user_token)
+        user_id = user_info.get("uid")
+        user_role = user_info.get("role", "")
+        user_dept = user_info.get("dept", "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    print(f"[Gateway] User JWT validated - uid: {user_id}, role: {user_role}, dept: {user_dept}")
+    
+    # ========== Step 2: 创建协作会话 ==========
+    session_id = create_session_id(user_id)
+    collaboration_sessions[session_id] = {
+        "user_id": user_id,
+        "user_jwt": x_user_token,
+        "user_info": user_info,
+        "authorized_agents": [],
+        "created_at": time.time()
+    }
+    print(f"[Gateway] Created collaboration session: {session_id}")
+    
+    # ========== Step 3: 获取用户请求内容 ==========
+    try:
+        request_body = await request.json()
+    except Exception:
+        request_body = {}
+    
+    user_query = request_body.get("query", "")
+    print(f"[Gateway] User query: {user_query}")
+    
+    # ========== Step 4: 转发给 Main Agent ==========
+    # 在实际系统中，这里会调用 Main Agent 的 API
+    # 为了简化测试，我们直接返回会话信息，让客户端继续流程
+    
+    return JSONResponse({
+        "status": "session_created",
+        "session_id": session_id,
+        "user_id": user_id,
+        "user_info": {
+            "uid": user_id,
+            "role": user_role,
+            "dept": user_dept
+        },
+        "message": "User JWT validated. Session created. Ready for agent authorization.",
+        "next_step": "Main Agent should call /gateway/authorize-agent-call to request Task Agent authorization"
+    })
+
+
+@app.post("/gateway/authorize-agent-call")
+async def authorize_agent_call_endpoint(
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+    x_session_id: Optional[str] = Header(None, alias="X-Session-Id")
+):
+    """
+    Agent 调用授权端点。
+    
+    Main Agent 请求调用 Task Agent 时调用此端点。
+    网关根据 ABAC 策略判断用户是否有权限调用该 Agent。
+    
+    请求体：
+    {
+        "target_agent_did": "did:agent:fin_analyst",
+        "task_description": "执行财务审计"
+    }
+    """
+    # ========== Step 1: 验证用户 JWT ==========
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    print(f"\n[Gateway] ========== Agent Authorization Request ==========")
+    
+    try:
+        user_info = decode_user_jwt(x_user_token)
+        user_id = user_info.get("uid")
+        user_role = user_info.get("role", "")
+        user_dept = user_info.get("dept", "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    print(f"[Gateway] User info - uid: {user_id}, role: {user_role}, dept: {user_dept}")
+    
+    # ========== Step 2: 获取请求内容 ==========
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid request body")
+    
+    target_agent_did = body.get("target_agent_did")
+    task_description = body.get("task_description", "")
+    
+    if not target_agent_did:
+        raise HTTPException(status_code=400, detail="Missing target_agent_did")
+    
+    print(f"[Gateway] Target Agent: {target_agent_did}")
+    print(f"[Gateway] Task: {task_description}")
+    
+    # ========== Step 3: 检查 Agent 是否已注册 ==========
+    if not registry.is_registered(target_agent_did):
+        print(f"[Gateway] Agent {target_agent_did} is not registered")
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Agent {target_agent_did} is not registered in the system"
+        )
+    
+    # ========== Step 4: ABAC 策略判定 ==========
+    # 检查用户是否有权限调用该 Agent
+    # 策略格式: p, user_dept, agent_did, call, allow
+    
+    sub = user_dept  # 用户部门作为主体
+    obj = target_agent_did  # 目标 Agent
+    act = "call"  # 操作类型
+    
+    print(f"[Gateway] ABAC Check: {sub} -> {obj} ({act})")
+    
+    try:
+        allowed = enforcer.enforce(sub, obj, act)
+    except Exception as e:
+        print(f"[Gateway] ABAC policy evaluation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"ABAC policy evaluation failed: {str(e)}"
+        )
+    
+    if not allowed:
+        # ========== 授权失败：直接拒绝用户 ==========
+        print(f"[Gateway] ABAC DENIED: User from {sub} is not allowed to call {obj}")
+        raise HTTPException(
+            status_code=403,
+            detail=f"Access Denied: User from department '{user_dept}' is not authorized to call agent '{target_agent_did}'. Cross-department access is not permitted."
+        )
+    
+    # ========== Step 5: 授权成功 ==========
+    print(f"[Gateway] ABAC ALLOWED: User from {sub} can call {obj}")
+    
+    # 将 Agent 加入协作组
+    if x_session_id and x_session_id in collaboration_sessions:
+        session = collaboration_sessions[x_session_id]
+        if target_agent_did not in session["authorized_agents"]:
+            session["authorized_agents"].append(target_agent_did)
+        print(f"[Gateway] Agent {target_agent_did} added to collaboration session {x_session_id}")
+    
+    # 生成授权凭证 (简化版，实际可以是签名的 Token)
+    authorization_token = jwt.encode({
+        "user_id": user_id,
+        "user_dept": user_dept,
+        "target_agent": target_agent_did,
+        "task": task_description,
+        "authorized": True,
+        "exp": int(time.time()) + 300  # 5分钟有效
+    }, JWT_SECRET, algorithm="HS256")
+    
+    return JSONResponse({
+        "status": "authorized",
+        "message": f"User {user_id} is authorized to call agent {target_agent_did}",
+        "authorization": {
+            "user_id": user_id,
+            "user_dept": user_dept,
+            "user_role": user_role,
+            "target_agent": target_agent_did,
+            "task_description": task_description,
+            "authorization_token": authorization_token
+        },
+        "next_step": "Task Agent can now execute the task"
+    })
+
+
+@app.get("/gateway/session/{session_id}")
+async def get_session_info(session_id: str):
+    """获取协作会话信息。"""
+    if session_id not in collaboration_sessions:
+        raise HTTPException(status_code=404, detail="Session not found")
+    
+    session = collaboration_sessions[session_id]
+    return {
+        "session_id": session_id,
+        "user_id": session["user_id"],
+        "authorized_agents": session["authorized_agents"],
+        "created_at": session["created_at"]
+    }
+
+
+# ==================== 原有端点 (Agent 调用 MCP Tool) ====================
 
 @app.post("/gateway/mcp/{tool_path:path}")
 async def gateway_endpoint(
@@ -110,18 +344,18 @@ async def gateway_endpoint(
     # ========== Step 3: 绑定校验 (关键逻辑) ==========
     # 检查 User Token 中的 uid 是否与 Task Token 中的 sub 一致
     if user_id != verified_token.sub:
-        print(f"[Gateway] ❌ Binding check FAILED: User token uid={user_id}, Task token sub={verified_token.sub}")
+        print(f"[Gateway] Binding check FAILED: User token uid={user_id}, Task token sub={verified_token.sub}")
         raise HTTPException(
             status_code=403,
             detail=f"Identity binding mismatch: User token uid ({user_id}) != Task token sub ({verified_token.sub})"
         )
     
-    print(f"[Gateway] ✅ Identity binding verified: User {user_id} is bound to Agent {agent_did}")
+    print(f"[Gateway] Identity binding verified: User {user_id} is bound to Agent {agent_did}")
     
     # 检查目标工具是否匹配
     expected_tool = f"urn:mcp:{tool_path}"
     if verified_token.target_tool != expected_tool:
-        print(f"[Gateway] ⚠️ Tool mismatch: Task token specifies {verified_token.target_tool}, but request is for {expected_tool}")
+        print(f"[Gateway] Tool mismatch: Task token specifies {verified_token.target_tool}, but request is for {expected_tool}")
         # 这里可以选择严格模式（拒绝）或宽松模式（使用 token 中指定的工具）
         # 为了安全，我们使用 token 中指定的工具
         expected_tool = verified_token.target_tool
@@ -131,25 +365,34 @@ async def gateway_endpoint(
     sub = agent_did  # Agent DID
     obj = verified_token.target_tool  # 目标工具
     act = "read"  # 操作类型（可以从请求中提取，这里简化处理）
-    timestamp = verified_token.timestamp
-    user_dept_attr = user_dept
-    user_role_attr = user_role
     
-    # 注意：这里简化了 Casbin 模型，实际可能需要自定义函数来处理时间约束等
-    # 由于 Casbin 的 ABAC 模型配置可能需要自定义函数，这里先进行基本的策略检查
-    # 实际应用中，需要扩展 Casbin 的匹配器函数
+    # 显式检查敏感工具（默认禁止）
+    forbidden_tools = ["urn:mcp:delete_db", "urn:mcp:format_disk"]
+    if obj in forbidden_tools:
+        print(f"[Gateway] ABAC policy DENIED: {sub} -> {obj} ({act}) - Tool is in forbidden list")
+        raise HTTPException(
+            status_code=403,
+            detail=f"ABAC policy denied: Agent {sub} is not allowed to access forbidden tool {obj}"
+        )
     
-    # 简化版 ABAC 检查：检查 (agent_did, tool, action) 是否允许
-    allowed = enforcer.enforce(sub, obj, act)
+    # 使用 Casbin 检查策略
+    try:
+        allowed = enforcer.enforce(sub, obj, act)
+    except Exception as e:
+        print(f"[Gateway] ABAC policy evaluation error: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"ABAC policy evaluation failed: {str(e)}"
+        )
     
     if not allowed:
-        print(f"[Gateway] ❌ ABAC policy DENIED: {sub} -> {obj} ({act})")
+        print(f"[Gateway] ABAC policy DENIED: {sub} -> {obj} ({act}) - No matching policy found")
         raise HTTPException(
             status_code=403,
             detail=f"ABAC policy denied: Agent {sub} is not allowed to access {obj}"
         )
     
-    print(f"[Gateway] ✅ ABAC policy ALLOWED: {sub} -> {obj} ({act})")
+    print(f"[Gateway] ABAC policy ALLOWED: {sub} -> {obj} ({act})")
     
     # ========== Step 5: 转发请求 ==========
     # 获取原始请求体
@@ -177,7 +420,184 @@ async def health_check():
     return {"status": "healthy", "service": "security-gateway"}
 
 
+@app.post("/gateway/test/{tool_path:path}")
+async def gateway_test_endpoint(
+    tool_path: str,
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+    x_task_token_payload: Optional[str] = Header(None, alias="X-Task-Token-Payload"),
+    x_task_token_signature: Optional[str] = Header(None, alias="X-Task-Token-Signature")
+):
+    """
+    测试端点：仅验证身份鉴别和权限控制，不转发到 MCP。
+    用于测试网关的安全验证功能。
+    """
+    try:
+        # ========== Step 1: 拦截 ==========
+        if not x_user_token:
+            raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+        
+        if not x_task_token_payload or not x_task_token_signature:
+            raise HTTPException(status_code=401, detail="Missing X-Task-Token headers")
+        
+        print(f"[Gateway Test] Intercepted request to tool: {tool_path}")
+        
+        # 解码 User Identity Token
+        try:
+            user_info = decode_user_jwt(x_user_token)
+            user_id = user_info.get("uid")
+            user_role = user_info.get("role", "")
+            user_dept = user_info.get("dept", "")
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[Gateway Test] Error decoding user JWT: {e}")
+            raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+        
+        print(f"[Gateway Test] User info - uid: {user_id}, role: {user_role}, dept: {user_dept}")
+        
+        # ========== Step 2: 验签 ==========
+        try:
+            task_token = decode_task_token_payload(x_task_token_payload)
+            if not task_token:
+                raise HTTPException(status_code=400, detail="Invalid Task-Token payload format")
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"[Gateway Test] Error decoding task token: {e}")
+            raise HTTPException(status_code=400, detail=f"Invalid Task-Token payload: {str(e)}")
+        
+        agent_did = task_token.iss
+        
+        # 从注册中心获取 Agent 公钥
+        agent_public_key = registry.get_public_key(agent_did)
+        if not agent_public_key:
+            raise HTTPException(status_code=403, detail=f"Agent {agent_did} not registered")
+        
+        # 验证 Task-MCP Token 签名
+        is_valid, verified_token = verify_task_token(
+            x_task_token_payload,
+            x_task_token_signature,
+            agent_public_key
+        )
+        
+        if not is_valid or not verified_token:
+            raise HTTPException(status_code=403, detail="Task-Token signature verification failed")
+        
+        print(f"[Gateway Test] Task-Token signature verified successfully")
+        
+        # ========== Step 3: 绑定校验 (关键逻辑) ==========
+        if user_id != verified_token.sub:
+            print(f"[Gateway Test] Binding check FAILED: User token uid={user_id}, Task token sub={verified_token.sub}")
+            raise HTTPException(
+                status_code=403,
+                detail=f"Identity binding mismatch: User token uid ({user_id}) != Task token sub ({verified_token.sub})"
+            )
+        
+        print(f"[Gateway Test] Identity binding verified: User {user_id} is bound to Agent {agent_did}")
+        
+        # 检查目标工具是否匹配
+        expected_tool = f"urn:mcp:{tool_path}"
+        if verified_token.target_tool != expected_tool:
+            expected_tool = verified_token.target_tool
+        
+        # ========== Step 4: ABAC 策略判定 ==========
+        sub = agent_did
+        obj = verified_token.target_tool
+        act = "read"
+        
+        # 显式检查是否允许访问（策略文件中只列出允许的，未列出的默认拒绝）
+        # 对于敏感操作（如 delete_db），即使策略中没有显式 deny，也默认拒绝
+        forbidden_tools = ["urn:mcp:delete_db", "urn:mcp:format_disk"]  # 默认禁止的工具列表
+        
+        if obj in forbidden_tools:
+            print(f"[Gateway Test] ABAC policy DENIED: {sub} -> {obj} ({act}) - Tool is in forbidden list")
+            raise HTTPException(
+                status_code=403,
+                detail=f"ABAC policy denied: Agent {sub} is not allowed to access forbidden tool {obj}"
+            )
+        
+        try:
+            allowed = enforcer.enforce(sub, obj, act)
+        except Exception as e:
+            print(f"[Gateway Test] ABAC policy evaluation error: {e}")
+            import traceback
+            traceback.print_exc()
+            raise HTTPException(
+                status_code=500,
+                detail=f"ABAC policy evaluation failed: {str(e)}"
+            )
+        
+        if not allowed:
+            print(f"[Gateway Test] ABAC policy DENIED: {sub} -> {obj} ({act}) - No matching policy found")
+            raise HTTPException(
+                status_code=403,
+                detail=f"ABAC policy denied: Agent {sub} is not allowed to access {obj}"
+            )
+        
+        print(f"[Gateway Test] ABAC policy ALLOWED: {sub} -> {obj} ({act})")
+        
+        # ========== 验证通过，返回成功（不转发到 MCP） ==========
+        return JSONResponse({
+            "status": "success",
+            "message": "All security checks passed",
+            "verification": {
+                "user_id": user_id,
+                "user_role": user_role,
+                "user_dept": user_dept,
+                "agent_did": agent_did,
+                "target_tool": verified_token.target_tool,
+                "identity_binding": "verified",
+                "signature": "verified",
+                "abac_policy": "allowed"
+            },
+            "note": "This is a test endpoint. MCP tool call is skipped."
+        })
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[Gateway Test] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+@app.post("/gateway/register-agent")
+async def register_agent(request: Request):
+    """
+    注册 Agent 端点（用于测试和开发）。
+    注意：生产环境中应该使用更安全的方式（如配置文件或管理接口）。
+    """
+    try:
+        body = await request.json()
+        agent_did = body.get("agent_did")
+        public_key_pem = body.get("public_key_pem")
+        metadata = body.get("metadata", {})
+        
+        if not agent_did or not public_key_pem:
+            raise HTTPException(status_code=400, detail="Missing agent_did or public_key_pem")
+        
+        # 从 PEM 字符串加载公钥
+        public_key = serialization.load_pem_public_key(
+            public_key_pem.encode('utf-8'),
+            backend=default_backend()
+        )
+        
+        registry.register_agent(agent_did, public_key, metadata)
+        return {"status": "success", "message": f"Agent {agent_did} registered"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+
+
+@app.get("/gateway/agents")
+async def list_registered_agents():
+    """列出所有已注册的 Agent（用于调试）。"""
+    return {
+        "agents": registry.get_all_agent_info(),
+        "total": len(registry.list_agents())
+    }
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
