@@ -2,15 +2,20 @@
 # 格式: p, agent_did, tool_urn, action, effect
 p, did:agent:fin_analyst, urn:mcp:audit, read, allow
 p, did:agent:fin_analyst, urn:mcp:report, read, allow
-p, did:agent:hr_agent, urn:mcp:employee_data, read, allow
+p, did:agent:hr_archivist, urn:mcp:employee_data, read, allow
+p, did:agent:hr_archivist, urn:mcp:personnel_records, read, allow
+p, did:agent:sales_assistant, urn:mcp:sales_query, read, allow
+p, did:agent:sales_assistant, urn:mcp:order_management, read, allow
 
 # 用户调用 Agent 的策略 (基于部门)
 # 格式: p, user_dept, agent_did, call, effect
 # Finance 部门可以调用 Finance Agent
 p, Finance, did:agent:fin_analyst, call, allow
 # HR 部门可以调用 HR Agent
-p, HR, did:agent:hr_agent, call, allow
+p, HR, did:agent:hr_archivist, call, allow
+# Sales 部门可以调用 Sales Agent
+p, Sales, did:agent:sales_assistant, call, allow
 # IT 部门可以调用所有 Agent (系统管理员)
 p, IT, did:agent:fin_analyst, call, allow
-p, IT, did:agent:hr_agent, call, allow
-# Sales 部门不能调用 Finance Agent (跨部门隔离)
+p, IT, did:agent:hr_archivist, call, allow
+p, IT, did:agent:sales_assistant, call, allow

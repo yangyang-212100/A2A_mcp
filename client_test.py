@@ -278,7 +278,7 @@ async def test_direct_agent_authorization():
             response = await client.post(
                 f"{GATEWAY_URL}/gateway/authorize-agent-call",
                 json={
-                    "target_agent_did": "did:agent:hr_agent",
+                    "target_agent_did": "did:agent:hr_archivist",  # 更新为新的 DID
                     "task_description": "查询员工信息"
                 },
                 headers={"X-User-Token": user_jwt_hr}

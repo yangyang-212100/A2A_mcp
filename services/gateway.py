@@ -565,8 +565,12 @@ async def gateway_test_endpoint(
 @app.post("/gateway/register-agent")
 async def register_agent(request: Request):
     """
-    注册 Agent 端点（用于测试和开发）。
-    注意：生产环境中应该使用更安全的方式（如配置文件或管理接口）。
+    注册 Agent 端点。
+    
+    Agent 通过 HTTP POST 注册到注册中心，提供：
+    - agent_did: Agent 的 DID 标识符
+    - public_key_pem: Agent 的公钥 (PEM 格式)
+    - metadata: Agent 的元数据 (type, owner, sensitivity, capabilities)
     """
     try:
         body = await request.json()
@@ -583,10 +587,52 @@ async def register_agent(request: Request):
             backend=default_backend()
         )
         
-        registry.register_agent(agent_did, public_key, metadata)
-        return {"status": "success", "message": f"Agent {agent_did} registered"}
+        # 注册 Agent 并获取详细信息
+        registration_info = registry.register_agent(agent_did, public_key, metadata)
+        
+        # 打印格式化的注册日志
+        print_registration_log(registration_info)
+        
+        return {
+            "status": "success",
+            "message": f"Agent {agent_did} registered successfully",
+            "registration": registration_info
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Registration failed: {str(e)}")
+
+
+def print_registration_log(info: dict):
+    """打印格式化的 Agent 注册日志。"""
+    from datetime import datetime
+    
+    # 敏感度级别对应的标记
+    sensitivity_marks = {
+        "Internal": "[Internal]",
+        "Confidential": "[Confidential]",
+        "TopSecret": "[TopSecret]"
+    }
+    
+    sensitivity = info.get("sensitivity", "unknown")
+    sensitivity_mark = sensitivity_marks.get(sensitivity, f"[{sensitivity}]")
+    
+    log = f"""
+================================================================================
+[Registry] Agent Registration Request Received
+================================================================================
+  Timestamp:    {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+  DID:          {info.get("did", "N/A")}
+  Type:         {info.get("type", "N/A")}
+  Owner:        {info.get("owner", "N/A")}
+  Sensitivity:  {sensitivity} {sensitivity_mark}
+  Capabilities: {info.get("capabilities", [])}
+--------------------------------------------------------------------------------
+  Status:       [OK] REGISTERED SUCCESSFULLY
+================================================================================
+"""
+    print(log)
 
 
 @app.get("/gateway/agents")
