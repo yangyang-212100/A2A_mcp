@@ -17,11 +17,13 @@ import jwt
 import casbin
 import os
 import time
+from datetime import datetime
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 from services.registry import registry
 from core.token_manager import decode_task_token_payload, verify_task_token
+from core.sm2_jwt import verify_sm2_jwt, get_auth_center_public_key
 
 
 app = FastAPI(title="Multi-Agent Security Gateway")
@@ -38,26 +40,112 @@ MCP_TOOL_SERVER_URL = "http://localhost:8001"
 # Main Agent 地址 (用于内部通信)
 MAIN_AGENT_URL = "http://localhost:8002"
 
-# JWT 密钥 (生产环境应该使用安全的密钥管理)
-JWT_SECRET = "dummy_secret"
+# 身份认证中心的公钥（用于验证 SM2 签名的 JWT）
+AUTH_CENTER_PUBLIC_KEY = get_auth_center_public_key()
+
+# 内部授权 Token 密钥（用于网关生成的授权凭证，非用户 JWT）
+JWT_SECRET = "gateway_internal_secret"
 
 # 协作组：存储当前会话中授权的 Agent
 # 结构: {session_id: {user_id, user_jwt, authorized_agents: [agent_did]}}
 collaboration_sessions: Dict[str, Dict[str, Any]] = {}
 
+# 是否输出详细的 JWT 验签日志
+JWT_VERBOSE_LOG = True
 
-def decode_user_jwt(token: str) -> dict:
+
+def decode_user_jwt(token: str, verbose: bool = None) -> dict:
     """
     解码并验证 User Identity Token (JWT)。
+    使用 SM2 国密算法验证签名。
     """
+    if verbose is None:
+        verbose = JWT_VERBOSE_LOG
+    
     try:
-        # 验证 JWT 签名和有效期
-        decoded = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return decoded
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="User token has expired")
-    except jwt.InvalidTokenError as e:
+        # 使用 SM2 验证 JWT
+        is_valid, payload, details = verify_sm2_jwt(
+            token, 
+            public_key=AUTH_CENTER_PUBLIC_KEY,
+            verbose=verbose
+        )
+        
+        # 输出详细的验签日志
+        if verbose:
+            print_jwt_verification_log(token, is_valid, payload, details)
+        
+        if not is_valid:
+            error_msg = "; ".join(details.get("errors", ["Unknown error"]))
+            raise HTTPException(status_code=401, detail=f"JWT verification failed: {error_msg}")
+        
+        # 转换字段名以兼容旧代码 (sub -> uid)
+        result = payload.copy()
+        result["uid"] = payload.get("sub")
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+
+
+def sanitize_for_console(text: str) -> str:
+    """移除或替换控制台不支持的 Unicode 字符。"""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.replace('✓', '[OK]').replace('✗', '[FAIL]').replace('✅', '[OK]').replace('❌', '[FAIL]')
+
+
+def print_jwt_verification_log(token: str, is_valid: bool, payload: dict, details: dict):
+    """打印详细的 JWT 验签日志。"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    log = f"""
+================================================================================
+[Gateway] JWT Verification Process
+================================================================================
+  Timestamp: {timestamp}
+  Token:     {token[:50]}...
+--------------------------------------------------------------------------------
+"""
+    
+    # 输出每个步骤
+    for step in details.get("steps", []):
+        step_num = step.get("step", "?")
+        step_name = step.get("name", "Unknown")
+        log += f"\n  Step {step_num}: {step_name}\n"
+        
+        for key, value in step.items():
+            if key not in ["step", "name"]:
+                if isinstance(value, dict):
+                    log += f"    {key}:\n"
+                    for k, v in value.items():
+                        log += f"      {k}: {sanitize_for_console(v)}\n"
+                else:
+                    log += f"    {key}: {sanitize_for_console(value)}\n"
+    
+    # 输出最终结果
+    status = "[OK] VERIFIED" if is_valid else "[FAILED] INVALID"
+    log += f"""
+--------------------------------------------------------------------------------
+  Verification Result: {status}
+"""
+    
+    if is_valid and payload:
+        log += f"""  User Attributes for ABAC:
+    - Subject.id:                 {payload.get('sub')}
+    - Subject.department:         {payload.get('dept')}
+    - Subject.role:               {payload.get('role')}
+    - Subject.security_clearance: {payload.get('clearance')}
+================================================================================
+"""
+    else:
+        errors = details.get("errors", [])
+        log += f"  Errors: {errors}\n"
+        log += "================================================================================\n"
+    
+    print(log)
 
 
 def create_session_id(user_id: str) -> str:
@@ -162,7 +250,8 @@ async def authorize_agent_call_endpoint(
     print(f"\n[Gateway] ========== Agent Authorization Request ==========")
     
     try:
-        user_info = decode_user_jwt(x_user_token)
+        # 授权端点不需要详细日志
+        user_info = decode_user_jwt(x_user_token, verbose=False)
         user_id = user_info.get("uid")
         user_role = user_info.get("role", "")
         user_dept = user_info.get("dept", "")
