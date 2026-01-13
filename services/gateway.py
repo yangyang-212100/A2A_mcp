@@ -22,7 +22,12 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.backends import default_backend
 
 from services.registry import registry
-from core.token_manager import decode_task_token_payload, verify_task_token
+from core.token_manager import (
+    decode_task_token_payload, 
+    verify_task_token,
+    verify_task_mcp_token,
+    compute_params_hash
+)
 from core.sm2_jwt import verify_sm2_jwt, get_auth_center_public_key
 
 
@@ -507,6 +512,214 @@ async def gateway_endpoint(
 async def health_check():
     """健康检查端点。"""
     return {"status": "healthy", "service": "security-gateway"}
+
+
+# ==================== Task-MCP Token 三元绑定验证 ====================
+
+@app.post("/gateway/verify-task-mcp-token")
+async def verify_task_mcp_token_endpoint(
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+    x_task_mcp_token: Optional[str] = Header(None, alias="X-Task-MCP-Token")
+):
+    """
+    验证 Task-MCP Token（三元绑定检查）。
+    
+    论文 3.3.3 章节核心实现：
+    1. 验证 Token 签名是否属于指定 Agent
+    2. 验证 Token 中的 user_id 是否等于当前会话用户
+    3. 重新计算请求参数哈希，验证参数完整性
+    
+    请求体:
+    {
+        "agent_did": "did:agent:fin_analyst",
+        "params": {"report_id": "Q1-2024", "type": "summary"}
+    }
+    
+    返回:
+    - 200: 验证通过，包含 Token 载荷信息
+    - 401: 用户身份验证失败
+    - 403: 三元绑定检查失败（签名/用户/参数）
+    """
+    # ========== Step 1: 验证用户会话 JWT ==========
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    if not x_task_mcp_token:
+        raise HTTPException(status_code=401, detail="Missing X-Task-MCP-Token header")
+    
+    try:
+        user_info = decode_user_jwt(x_user_token, verbose=False)
+        session_user_id = user_info.get("uid")
+        user_dept = user_info.get("dept", "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    # ========== Step 2: 获取请求体 ==========
+    try:
+        body = await request.json()
+        agent_did = body.get("agent_did")
+        current_params = body.get("params", {})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {str(e)}")
+    
+    if not agent_did:
+        raise HTTPException(status_code=400, detail="Missing agent_did in request body")
+    
+    print(f"\n[Gateway] ========== Task-MCP Token Verification ==========")
+    print(f"[Gateway] Session User: {session_user_id}")
+    print(f"[Gateway] Agent DID: {agent_did}")
+    print(f"[Gateway] Current Params: {current_params}")
+    
+    # ========== Step 3: 三元绑定检查 ==========
+    is_valid, payload, details = verify_task_mcp_token(
+        token=x_task_mcp_token,
+        agent_did=agent_did,
+        expected_user_id=session_user_id,
+        current_params=current_params,
+        verbose=True
+    )
+    
+    # 输出验证详情
+    for step in details.get("steps", []):
+        step_name = step.get("name", "")
+        result = step.get("result", "")
+        print(f"[Gateway] {step_name}: {result}")
+    
+    if not is_valid:
+        error_msgs = details.get("errors", ["Unknown error"])
+        error_detail = "; ".join(error_msgs)
+        
+        # 区分错误类型返回不同的错误信息
+        if "Parameter integrity violation" in error_detail.lower():
+            print(f"[Gateway] [FAIL] Parameter Integrity Violation Detected!")
+            raise HTTPException(
+                status_code=403, 
+                detail="Parameter Integrity Violation: Request parameters have been tampered with."
+            )
+        elif "User identity mismatch" in error_detail.lower():
+            print(f"[Gateway] [FAIL] User Identity Mismatch!")
+            raise HTTPException(
+                status_code=403,
+                detail=f"User Identity Mismatch: Token user does not match session user."
+            )
+        elif "signature" in error_detail.lower():
+            print(f"[Gateway] [FAIL] Agent Signature Verification Failed!")
+            raise HTTPException(
+                status_code=403,
+                detail="Agent Signature Verification Failed: Invalid or forged token."
+            )
+        else:
+            print(f"[Gateway] [FAIL] {error_detail}")
+            raise HTTPException(status_code=403, detail=error_detail)
+    
+    print(f"[Gateway] [OK] Three-Way Binding Verification PASSED!")
+    print(f"[Gateway] Token Intent: target={payload['intent']['target']}, action={payload['intent']['action']}")
+    
+    # ========== Step 4: 返回验证结果 ==========
+    return {
+        "status": "verified",
+        "message": "Task-MCP Token three-way binding verification passed",
+        "token_payload": payload,
+        "verification_details": {
+            "agent_signature": "valid",
+            "user_binding": "valid",
+            "params_integrity": "valid"
+        }
+    }
+
+
+@app.post("/gateway/execute-with-task-mcp-token")
+async def execute_with_task_mcp_token(
+    request: Request,
+    x_user_token: Optional[str] = Header(None, alias="X-User-Token"),
+    x_task_mcp_token: Optional[str] = Header(None, alias="X-Task-MCP-Token")
+):
+    """
+    使用 Task-MCP Token 执行 MCP 工具调用。
+    
+    完整流程：
+    1. 验证用户会话 JWT
+    2. 三元绑定检查（签名、用户、参数）
+    3. 执行 MCP 工具（模拟）
+    
+    请求体:
+    {
+        "agent_did": "did:agent:fin_analyst",
+        "params": {"report_id": "Q1-2024", "type": "summary"}
+    }
+    """
+    # ========== Step 1: 验证用户会话 JWT ==========
+    if not x_user_token:
+        raise HTTPException(status_code=401, detail="Missing X-User-Token header")
+    
+    if not x_task_mcp_token:
+        raise HTTPException(status_code=401, detail="Missing X-Task-MCP-Token header")
+    
+    try:
+        user_info = decode_user_jwt(x_user_token, verbose=False)
+        session_user_id = user_info.get("uid")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid user token: {str(e)}")
+    
+    # ========== Step 2: 获取请求体 ==========
+    try:
+        body = await request.json()
+        agent_did = body.get("agent_did")
+        current_params = body.get("params", {})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid request body: {str(e)}")
+    
+    if not agent_did:
+        raise HTTPException(status_code=400, detail="Missing agent_did in request body")
+    
+    # ========== Step 3: 三元绑定检查 ==========
+    is_valid, payload, details = verify_task_mcp_token(
+        token=x_task_mcp_token,
+        agent_did=agent_did,
+        expected_user_id=session_user_id,
+        current_params=current_params,
+        verbose=False
+    )
+    
+    if not is_valid:
+        error_msgs = details.get("errors", ["Unknown error"])
+        error_detail = "; ".join(error_msgs)
+        
+        if "Parameter integrity violation" in error_detail.lower():
+            raise HTTPException(
+                status_code=403, 
+                detail="403 Forbidden: Parameter Integrity Violation"
+            )
+        else:
+            raise HTTPException(status_code=403, detail=error_detail)
+    
+    # ========== Step 4: 模拟执行 MCP 工具 ==========
+    target = payload["intent"]["target"]
+    action = payload["intent"]["action"]
+    
+    # 模拟执行结果
+    execution_result = {
+        "status": "success",
+        "target": target,
+        "action": action,
+        "result": {
+            "data": f"Executed {action} on {target}",
+            "report_id": current_params.get("report_id"),
+            "summary": "Financial report retrieved successfully"
+        }
+    }
+    
+    return {
+        "status": "executed",
+        "message": "MCP tool execution completed",
+        "token_verified": True,
+        "execution_result": execution_result
+    }
 
 
 @app.post("/gateway/test/{tool_path:path}")

@@ -18,6 +18,7 @@ from core.sm2_jwt import (
     AUTH_CENTER_PUBLIC_KEY,
     ISSUER
 )
+from core.token_manager import compute_params_hash
 
 
 GATEWAY_URL = "http://localhost:8000"
@@ -506,6 +507,187 @@ async def test_user_jwt_validation():
     return True
 
 
+# ==================== Task-MCP Token 完整性测试 ====================
+
+async def test_task_mcp_token_integrity():
+    """
+    测试 Task-MCP Token 的三元绑定验证（论文 3.3.3 章节）。
+    
+    测试场景：
+    A. 正常调用：Finance Agent 生成 Token，网关验证通过
+    B. 参数篡改拦截：Token 生成后参数被篡改，网关检测并拒绝
+    """
+    print("\n" + "="*80)
+    print("  Test: Task-MCP Token Integrity (Three-Way Binding)")
+    print("  (Paper Section 3.3.3 - Parameter Hash Verification)")
+    print("="*80)
+    
+    # 创建 Finance Agent 实例
+    finance_agent = FinanceAgent()
+    
+    # 用户信息
+    user_id = "User_C"
+    user_dept = "Finance"
+    user_role = "Director"
+    user_clearance = 4
+    session_id = f"session_{user_id}_test"
+    
+    # 创建用户 JWT
+    user_jwt = create_user_jwt(user_id, user_role, user_dept)
+    
+    # 原始请求参数
+    original_params = {
+        "report_id": "Q1-2024",
+        "type": "summary",
+        "format": "pdf"
+    }
+    
+    # ==================== Scenario A: Normal Call ====================
+    print(f"\n" + "-"*80)
+    print(f"  Scenario A: Normal Call (Parameters NOT Tampered)")
+    print(f"-"*80)
+    
+    print(f"\n  [Step 1] Finance Agent performs business reasoning...")
+    print(f"    Task: Query financial report")
+    print(f"    Parameters: {original_params}")
+    
+    # Finance Agent 生成 Task-MCP Token
+    print(f"\n  [Step 2] Finance Agent generates Task-MCP Token...")
+    
+    task_mcp_token, token_details = finance_agent.generate_task_mcp_token(
+        user_id=user_id,
+        clearance=user_clearance,
+        session_id=session_id,
+        task_description="Query financial report",
+        params=original_params,
+        verbose=True
+    )
+    
+    # 展示 Token 载荷（对应论文表 3-2）
+    payload = token_details.get("payload", {})
+    print(f"\n  [Token Payload - Table 3-2]")
+    print(f"  +---------------------------------------------------------------+")
+    print(f"  |  jti:         {payload.get('jti', 'N/A'):<47}|")
+    print(f"  |  iss:         {payload.get('iss', 'N/A'):<47}|")
+    print(f"  |  context:                                                     |")
+    print(f"  |    user_id:   {payload.get('context', {}).get('user_id', 'N/A'):<47}|")
+    print(f"  |    clearance: {payload.get('context', {}).get('clearance', 'N/A'):<47}|")
+    print(f"  |    session:   {payload.get('context', {}).get('session_id', 'N/A')[:40]:<47}|")
+    print(f"  |  intent:                                                      |")
+    print(f"  |    target:    {payload.get('intent', {}).get('target', 'N/A'):<47}|")
+    print(f"  |    action:    {payload.get('intent', {}).get('action', 'N/A'):<47}|")
+    print(f"  |  params_hash: {token_details.get('params_hash', 'N/A')[:40]}...   |")
+    print(f"  +---------------------------------------------------------------+")
+    
+    print(f"\n  [Step 3] User sends request to Gateway with Task-MCP Token...")
+    print(f"    Headers:")
+    print(f"      X-User-Token: {user_jwt[:50]}...")
+    print(f"      X-Task-MCP-Token: {task_mcp_token[:50]}...")
+    print(f"    Body:")
+    print(f"      agent_did: {finance_agent.agent_did}")
+    print(f"      params: {original_params}")
+    
+    # 发送验证请求（参数未被篡改）
+    print(f"\n  [Step 4] Gateway verifies Task-MCP Token (Three-Way Binding)...")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{GATEWAY_URL}/gateway/verify-task-mcp-token",
+                json={
+                    "agent_did": finance_agent.agent_did,
+                    "params": original_params  # 原始参数，未篡改
+                },
+                headers={
+                    "X-User-Token": user_jwt,
+                    "X-Task-MCP-Token": task_mcp_token
+                }
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                print(f"\n  [OK] Three-Way Binding Verification PASSED!")
+                print(f"    Agent Signature: Valid")
+                print(f"    User Binding:    Valid (token.user_id == session.user_id)")
+                print(f"    Params Hash:     Valid (no tampering detected)")
+                scenario_a_passed = True
+            else:
+                print(f"\n  [FAILED] Unexpected rejection: {response.status_code}")
+                print(f"    Response: {response.text}")
+                scenario_a_passed = False
+    except Exception as e:
+        print(f"\n  [ERROR] {e}")
+        scenario_a_passed = False
+    
+    # ==================== Scenario B: Parameter Tampering ====================
+    print(f"\n" + "-"*80)
+    print(f"  Scenario B: Parameter Tampering Attack (Interception)")
+    print(f"-"*80)
+    
+    # 模拟攻击者篡改参数
+    tampered_params = {
+        "report_id": "CONFIDENTIAL-SALARY-2024",  # 篡改为敏感报告
+        "type": "summary",
+        "format": "pdf"
+    }
+    
+    print(f"\n  [Attack Simulation]")
+    print(f"    Original params:  {original_params}")
+    print(f"    Tampered params:  {tampered_params}")
+    print(f"    Attacker changed: report_id 'Q1-2024' -> 'CONFIDENTIAL-SALARY-2024'")
+    
+    # 计算两个哈希值对比
+    original_hash = compute_params_hash(original_params)
+    tampered_hash = compute_params_hash(tampered_params)
+    
+    print(f"\n  [Hash Comparison]")
+    print(f"    Token params_hash:   {original_hash[:40]}...")
+    print(f"    Current params_hash: {tampered_hash[:40]}...")
+    print(f"    Match: {'Yes' if original_hash == tampered_hash else 'NO - MISMATCH DETECTED!'}")
+    
+    print(f"\n  [Step 5] Attacker sends tampered request to Gateway...")
+    
+    # 发送验证请求（参数已被篡改）
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{GATEWAY_URL}/gateway/verify-task-mcp-token",
+                json={
+                    "agent_did": finance_agent.agent_did,
+                    "params": tampered_params  # 篡改后的参数！
+                },
+                headers={
+                    "X-User-Token": user_jwt,
+                    "X-Task-MCP-Token": task_mcp_token  # Token 包含原始参数的哈希
+                }
+            )
+            
+            if response.status_code == 403:
+                error_detail = response.json().get("detail", "")
+                print(f"\n  [OK] Attack Successfully Blocked!")
+                print(f"    Status: 403 Forbidden")
+                print(f"    Reason: {error_detail}")
+                scenario_b_passed = True
+            else:
+                print(f"\n  [FAILED] Attack should have been blocked!")
+                print(f"    Expected: 403 Forbidden")
+                print(f"    Got: {response.status_code}")
+                print(f"    Response: {response.text}")
+                scenario_b_passed = False
+    except Exception as e:
+        print(f"\n  [ERROR] {e}")
+        scenario_b_passed = False
+    
+    # ==================== 结果汇总 ====================
+    print(f"\n" + "-"*80)
+    print(f"  Test Results")
+    print(f"-"*80)
+    print(f"  Scenario A (Normal Call):        {'[PASS]' if scenario_a_passed else '[FAIL]'}")
+    print(f"  Scenario B (Tampering Attack):   {'[PASS]' if scenario_b_passed else '[FAIL]'}")
+    
+    return scenario_a_passed and scenario_b_passed
+
+
 async def main():
     """运行所有测试。"""
     print("\n" + "="*70)
@@ -547,6 +729,9 @@ async def main():
     
     # Test 4: 完整流程 - 拒绝
     results.append(("Full Flow - Denied", await test_full_authorization_flow_denied()))
+    
+    # Test 5: Task-MCP Token 完整性测试
+    results.append(("Task-MCP Token Integrity", await test_task_mcp_token_integrity()))
     
     # 总结
     print("\n" + "="*70)
